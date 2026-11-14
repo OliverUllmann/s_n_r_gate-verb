@@ -1,0 +1,9 @@
+/build*/
+/_deps/
+/dist/
+/test-output/
+/.cache/
+.DS_Store
+*.user
+*.xcuserstate
+xcuserdata/

@@ -1,0 +1,123 @@
+name: Build macOS VST3
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-vst3-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Universal VST3 and validation
+    runs-on: macos-15-intel
+    timeout-minutes: 40
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 3
+      PLUGINVAL_VERSION: v1.0.4
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          cmake --version
+          uname -m
+
+      - name: Cache pinned JUCE source
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: |
+            build/_deps/juce-src
+            build/_deps/juce-subbuild
+          key: juce-8.0.17-security-macos-v1
+
+      - name: Configure Intel and Apple Silicon
+        run: >-
+          cmake -S . -B build -G "Unix Makefiles"
+          -DCMAKE_BUILD_TYPE=Release
+          '-DCMAKE_OSX_ARCHITECTURES=x86_64;arm64'
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
+          -DGATEVERB_BUILD_TESTS=ON
+
+      - name: Build plugin and tests
+        run: cmake --build build --config Release --target GateVerb_VST3 GateVerbDspTests GateVerbProcessorTests
+
+      - name: Run audio and preset regression tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Render actual plugin editor
+        run: |
+          mkdir -p test-output
+          ./build/GateVerbProcessorTests --snapshot "$GITHUB_WORKSPACE/test-output/GATE-VERB-UI.png"
+
+      - name: Verify architectures and local signature
+        run: |
+          plugin="build/GateVerb_artefacts/Release/VST3/GATE-VERB.vst3"
+          binary="$plugin/Contents/MacOS/GATE-VERB"
+          lipo -info "$binary"
+          lipo -verify_arch x86_64 arm64 "$binary"
+          codesign --force --deep --sign - "$plugin"
+          codesign --verify --deep --strict --verbose=2 "$plugin"
+
+      - name: Validate the built VST3 in a host
+        run: |
+          mkdir -p .cache/pluginval test-output/pluginval
+          curl --fail --location --retry 3 --silent --show-error \
+            "https://github.com/Tracktion/pluginval/releases/download/$PLUGINVAL_VERSION/pluginval_macOS.zip" \
+            -o .cache/pluginval.zip
+          echo '3c4c533bda0c5059eea3ddaea752d757ee2025041f0f47e6bcb0e87f6082b29f  .cache/pluginval.zip' | shasum -a 256 -c -
+          ditto -x -k .cache/pluginval.zip .cache/pluginval
+          .cache/pluginval/pluginval.app/Contents/MacOS/pluginval \
+            --strictness-level 5 \
+            --timeout-ms 180000 \
+            --output-dir "$GITHUB_WORKSPACE/test-output/pluginval" \
+            --validate "$GITHUB_WORKSPACE/build/GateVerb_artefacts/Release/VST3/GATE-VERB.vst3"
+
+      - name: Package VST3, instructions and corresponding source
+        run: bash scripts/package-macos.sh build
+
+      - name: Upload downloadable plugin
+        id: plugin-artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: GATE-VERB-macOS-Universal
+          path: |
+            dist/GATE-VERB-1.0.0-macOS-Universal.zip
+            dist/GATE-VERB-1.0.0-macOS-Universal.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+
+      - name: Upload validation logs and editor screenshot
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: GATE-VERB-validation
+          path: |
+            test-output/
+            build/Testing/Temporary/LastTest.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Summarize download
+        env:
+          ARTIFACT_URL: ${{ steps.plugin-artifact.outputs.artifact-url }}
+        run: |
+          {
+            echo '## GATE-VERB for macOS'
+            echo "[Download the universal VST3]($ARTIFACT_URL)"
+            echo ''
+            echo '- Architectures: Intel x86_64 and Apple Silicon arm64.'
+            echo '- DSP/state regression checks and pluginval level 5 passed.'
+            echo '- Contains the VST3, German quick start, screenshot and matching source.'
+            echo '- Locally ad-hoc signed; Developer ID signing/notarization is left to the owner.'
+            echo "- Source commit: $GITHUB_SHA"
+          } >> "$GITHUB_STEP_SUMMARY"
