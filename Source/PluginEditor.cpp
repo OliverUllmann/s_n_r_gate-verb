@@ -178,6 +178,7 @@ public:
     GateVerbDial (GateVerbAudioProcessor& p, juce::String id, juce::String title, juce::String tip)
         : parameterId (std::move (id)), name (std::move (title))
     {
+        slider.setName (name);
         slider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
         slider.setRotaryParameters (juce::MathConstants<float>::pi * 1.25f,
                                     juce::MathConstants<float>::pi * 2.75f, true);
@@ -221,6 +222,7 @@ class GateVerbCurveEditor final : public juce::Component
 public:
     explicit GateVerbCurveEditor (GateVerbAudioProcessor& p) : processor (p), values (p.getCurve())
     {
+        setName ("Gate amplitude curve");
         setMouseCursor (juce::MouseCursor::CrosshairCursor);
         setWantsKeyboardFocus (true);
         history.fill (0.0f);
@@ -243,7 +245,7 @@ public:
     {
         phase = processor.visualPhase.load (std::memory_order_relaxed);
         gate = processor.visualGate.load (std::memory_order_relaxed);
-        const auto level = juce::jlimit (0.0f, 1.0f, processor.meterWet.load (std::memory_order_relaxed));
+        const auto level = juce::jlimit (0.0f, 1.0f, processor.meterWet.exchange (0.0f, std::memory_order_relaxed));
         const auto previous = history[(historyIndex + history.size() - 1) % history.size()];
         history[historyIndex] = juce::jmax (level, previous * 0.84f);
         historyIndex = (historyIndex + 1) % history.size();
@@ -322,8 +324,9 @@ public:
         juce::Path envelope;
         envelope.startNewSubPath (plot.getX(), plot.getBottom() - values[0] * plot.getHeight());
         for (size_t i = 1; i < values.size(); ++i)
-            envelope.lineTo (plot.getX() + plot.getWidth() * static_cast<float> (i) / static_cast<float> (values.size() - 1),
+            envelope.lineTo (plot.getX() + plot.getWidth() * static_cast<float> (i) / static_cast<float> (values.size()),
                              plot.getBottom() - values[i] * plot.getHeight());
+        envelope.lineTo (plot.getRight(), plot.getBottom() - values[0] * plot.getHeight());
         auto fill = envelope;
         fill.lineTo (plot.getRight(), plot.getBottom());
         fill.lineTo (plot.getX(), plot.getBottom());
@@ -432,8 +435,10 @@ private:
         }
         else
         {
-            const int first = juce::roundToInt (a.x * static_cast<float> (values.size() - 1));
-            const int last = juce::roundToInt (b.x * static_cast<float> (values.size() - 1));
+            const int first = juce::jlimit (0, static_cast<int> (values.size()) - 1,
+                                          juce::roundToInt (a.x * static_cast<float> (values.size())));
+            const int last = juce::jlimit (0, static_cast<int> (values.size()) - 1,
+                                         juce::roundToInt (b.x * static_cast<float> (values.size())));
             for (int i = first; i <= last; ++i)
             {
                 const auto t = last > first ? static_cast<float> (i - first) / static_cast<float> (last - first) : 1.0f;
@@ -726,14 +731,15 @@ void GateVerbAudioProcessorEditor::resized()
 void GateVerbAudioProcessorEditor::timerCallback()
 {
     curve->tick();
-    meters->setLevels (processor.meterIn.load (std::memory_order_relaxed), processor.meterOut.load (std::memory_order_relaxed));
+    meters->setLevels (processor.meterIn.exchange (0.0f, std::memory_order_relaxed),
+                      processor.meterOut.exchange (0.0f, std::memory_order_relaxed));
     const bool sync = processor.apvts.getRawParameterValue ("sync")->load() > 0.5f;
     const bool playing = processor.visualPlaying.load (std::memory_order_relaxed);
     const bool hasHost = processor.visualHasHost.load (std::memory_order_relaxed);
     const auto bpm = processor.visualBpm.load (std::memory_order_relaxed);
     juce::String status;
     if (! sync) status = "FREE RUN  /  CONTINUOUS";
-    else if (! hasHost) status = "120 BPM  /  INTERNAL FALLBACK";
+    else if (! hasHost) status = juce::String (bpm, 1) + " BPM  /  INTERNAL CLOCK";
     else status = juce::String (bpm, 1) + " BPM  /  " + (playing ? "PLAYING" : "STOPPED");
     clockLabel.setText (status, juce::dontSendNotification);
     modeLabel.setText (juce::String (juce::roundToInt (processor.visualGate.load (std::memory_order_relaxed) * 100.0f)) + "%", juce::dontSendNotification);
@@ -767,9 +773,12 @@ void GateVerbAudioProcessorEditor::updateControlStates()
 
 void GateVerbAudioProcessorEditor::refreshPresetName()
 {
-    const auto title = processor.getPresetName() + (processor.isPresetDirty() ? "  *" : "");
+    const auto name = processor.getPresetName();
+    const auto title = name + (processor.isPresetDirty() ? "  *" : "");
     if (presetBox.getText() != title)
     {
+        const auto factoryIndex = processor.getFactoryPresetNames().indexOf (name);
+        if (factoryIndex >= 0) lastFactoryPreset = factoryIndex;
         refreshing = true;
         presetBox.setText (title, juce::dontSendNotification);
         refreshing = false;

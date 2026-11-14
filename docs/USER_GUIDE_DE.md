@@ -43,7 +43,9 @@ Das Gate ist eine periodische Lautstärkehüllkurve, kein pegelabhängiges Noise
 
 Das Wechseln des Zeichenmodus verändert die vorhandene Kurve nicht automatisch. In Steps werden nur die Zellen verändert, über die du tatsächlich zeichnest. Die vertikale Position bleibt frei wählbar; das Raster bezieht sich auf die Zeit.
 
-Die Form-Schaltflächen liefern Ausgangskurven:
+Mit gedrückter **Shift-Taste** rastet die Amplitude beim Zeichnen in 10%-Schritten ein. Das Ende des Zyklus wird mit dem Anfang verbunden; der kurze Übergang am rechten Rand zeigt diese Schleifenverbindung.
+
+Die Auswahl **QUICK SHAPES** liefert Ausgangskurven:
 
 | Form | Wirkung |
 | --- | --- |

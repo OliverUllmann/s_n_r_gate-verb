@@ -66,6 +66,7 @@ private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     void parameterChanged (const juce::String&, float) override;
     void markChanged();
+    void publishCurve (const Curve&);
     void readCurveForAudio() noexcept;
     juce::ValueTree makeState();
     juce::Result restoreState (const juce::ValueTree&);

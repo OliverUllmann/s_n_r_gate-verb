@@ -26,6 +26,59 @@ void setActual (GateVerbAudioProcessor& processor, const char* id, float value)
     parameter->setValueNotifyingHost (parameter->convertTo0to1 (value));
 }
 
+struct HostChangeProbe final : juce::AudioProcessorListener
+{
+    explicit HostChangeProbe (juce::AudioProcessor& p) : processor (p)
+    {
+        processor.addListener (this);
+    }
+    ~HostChangeProbe() override { processor.removeListener (this); }
+
+    void audioProcessorParameterChanged (juce::AudioProcessor*, int, float) override {}
+    void audioProcessorChanged (juce::AudioProcessor*, const ChangeDetails& details) override
+    {
+        if (details.nonParameterStateChanged)
+            nonParameterChanges.fetch_add (1, std::memory_order_relaxed);
+    }
+
+    juce::AudioProcessor& processor;
+    std::atomic<int> nonParameterChanges { 0 };
+};
+
+void testHostChangeNotifications()
+{
+    GateVerbAudioProcessor processor;
+    juce::MemoryBlock cleanState;
+    processor.getStateInformation (cleanState);
+    const auto cleanCurve = processor.getCurve();
+    const auto cleanMode = processor.getEditorMode();
+    const auto cleanGrid = processor.getGridSize();
+    HostChangeProbe host (processor);
+
+    processor.setCurve (GateVerbAudioProcessor::makeShape (5));
+    require (host.nonParameterChanges.exchange (0) > 0,
+             "Drawing a gate must tell the host that the session needs saving");
+    processor.setGridSize (cleanGrid == 32 ? 16 : 32);
+    require (host.nonParameterChanges.exchange (0) > 0,
+             "Changing the saved grid must tell the host that the session needs saving");
+    processor.setEditorMode (cleanMode == 0 ? 1 : 0);
+    require (host.nonParameterChanges.exchange (0) > 0,
+             "Changing the saved draw mode must tell the host that the session needs saving");
+
+    // Hosts restore state during plugin scanning, project load and offline
+    // rendering. Recall must not mark a just-loaded project as modified.
+    processor.setStateInformation (cleanState.getData(), static_cast<int> (cleanState.getSize()));
+    require (host.nonParameterChanges.load() == 0,
+             "Host state recall must not send a non-parameter edit notification");
+    require (processor.getEditorMode() == cleanMode && processor.getGridSize() == cleanGrid,
+             "Silent host recall must still restore the saved editor settings");
+    require (! processor.isPresetDirty(), "Clean host state must restore the saved clean status");
+    const auto recalledCurve = processor.getCurve();
+    for (std::size_t i = 0; i < cleanCurve.size(); ++i)
+        require (std::abs (recalledCurve[i] - cleanCurve[i]) < 1.0e-6f,
+                 "Silent host recall must still restore the saved gate curve");
+}
+
 void testStateAndPresets()
 {
     GateVerbAudioProcessor original;
@@ -70,6 +123,57 @@ void testStateAndPresets()
         require (std::abs (original.apvts.getRawParameterValue (id)->load()
                         - restored.apvts.getRawParameterValue (id)->load()) < 0.002f,
                  "A parameter changed after a user-preset roundtrip");
+
+    const auto validXml = juce::XmlDocument::parse (presetFile);
+    require (validXml != nullptr, "Unable to read the valid preset fixture");
+    std::array<float, ids.size()> previousParameters {};
+    for (std::size_t i = 0; i < ids.size(); ++i)
+        previousParameters[i] = restored.apvts.getRawParameterValue (ids[i])->load();
+    const auto previousCurve = restored.getCurve();
+    const auto previousName = restored.getPresetName();
+    HostChangeProbe host (restored);
+    const auto expectRejected = [&] (const juce::ValueTree& malformed, const char* failure)
+    {
+        const auto malformedXml = malformed.createXml();
+        require (malformedXml != nullptr && presetFile.replaceWithText (malformedXml->toString()),
+                 "Unable to write malformed test preset");
+        require (restored.loadUserPreset (presetFile).failed(), failure);
+        for (std::size_t i = 0; i < ids.size(); ++i)
+            require (restored.apvts.getRawParameterValue (ids[i])->load() == previousParameters[i],
+                     "Rejected preset must not partially change any parameter");
+        require (restored.getCurve() == previousCurve && restored.getPresetName() == previousName
+                 && ! restored.isPresetDirty(),
+                 "Rejected preset must preserve the curve, name and clean status");
+        require (host.nonParameterChanges.load() == 0,
+                 "Rejected preset must not notify the host of a state edit");
+    };
+    for (const auto* invalidValue : { "25oops", "nan", "inf", "", "1e1000", "101", "-1" })
+    {
+        auto malformed = juce::ValueTree::fromXml (*validXml);
+        // A different valid parameter precedes the malformed one: rejecting the
+        // whole document must leave this earlier parameter unchanged as well.
+        malformed.getChildWithProperty ("id", "input").setProperty ("value", -22.0f, nullptr);
+        malformed.getChildWithProperty ("id", "mix").setProperty ("value", invalidValue, nullptr);
+        expectRejected (malformed,
+                        "Malformed, non-finite or out-of-range parameter text must be rejected");
+    }
+
+    auto duplicated = juce::ValueTree::fromXml (*validXml);
+    auto laterMix = duplicated.getChildWithProperty ("id", "mix").createCopy();
+    laterMix.setProperty ("value", 99.0f, nullptr);
+    duplicated.appendChild (laterMix, nullptr);
+    expectRejected (duplicated,
+                    "A later duplicate PARAM with id=mix must not override the validated value");
+
+    auto wrongType = juce::ValueTree::fromXml (*validXml);
+    const auto mixNode = wrongType.getChildWithProperty ("id", "mix");
+    const auto mixIndex = wrongType.indexOf (mixNode);
+    juce::ValueTree disguisedMix ("WrongNodeType");
+    disguisedMix.copyPropertiesFrom (mixNode, nullptr);
+    wrongType.removeChild (mixNode, nullptr);
+    wrongType.addChild (disguisedMix, mixIndex, nullptr);
+    expectRejected (wrongType,
+                    "A node with id=mix and a non-PARAM type must be rejected");
 
     const float previousMix = restored.apvts.getRawParameterValue ("mix")->load();
     require (presetFile.replaceWithText ("<GateVerbState schemaVersion=\"1\"/>"),
@@ -167,11 +271,13 @@ int main (int argc, char** argv)
     juce::ScopedJuceInitialiser_GUI initialiseJuce;
     try
     {
+        testHostChangeNotifications();
         testStateAndPresets();
         testLayoutsAndBlocks();
         if (argc == 3 && juce::String (argv[1]) == "--snapshot")
             writeSnapshot (juce::File (juce::String (argv[2])));
-        std::cout << "PASS: 18-parameter/256-point state, presets, corrupt-state rejection, "
+        std::cout << "PASS: host edit/recall notifications, 18-parameter/256-point state, "
+                     "presets, corrupt-state/numeric rejection, "
                      "mono/stereo, zero/variable/oversized blocks, re-prepare\n";
         return 0;
     }

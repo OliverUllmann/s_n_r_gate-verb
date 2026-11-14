@@ -12,6 +12,23 @@ constexpr std::array<const char*, 18> parameterIds {
 };
 constexpr const char* stateType = "GateVerbState";
 constexpr int stateVersion = 1;
+static_assert (std::atomic<float>::is_always_lock_free && std::atomic<uint32_t>::is_always_lock_free,
+               "The audio curve requires lock-free native atomics.");
+
+bool isValidGridSize (int size)
+{
+    return size == 4 || size == 8 || size == 16 || size == 32 || size == 64;
+}
+
+void accumulatePeak (std::atomic<float>& meter, float peak) noexcept
+{
+    // The UI consumes this maximum at 30 Hz, so short transients are retained.
+    // Bound the retry count: even a simultaneous UI read cannot stall audio.
+    float previous = meter.load (std::memory_order_relaxed);
+    for (int attempt = 0; attempt < 2 && peak > previous; ++attempt)
+        if (meter.compare_exchange_strong (previous, peak, std::memory_order_relaxed))
+            break;
+}
 
 juce::NormalisableRange<float> range (float lo, float hi, float step, float centre = 0.0f)
 {
@@ -236,9 +253,9 @@ void GateVerbAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
         outPeak = std::max (outPeak, engine.getOutputPeak());
         wetPeak = std::max (wetPeak, engine.getWetPeak());
     }
-    meterIn.store (inPeak, std::memory_order_relaxed);
-    meterOut.store (outPeak, std::memory_order_relaxed);
-    meterWet.store (wetPeak, std::memory_order_relaxed);
+    accumulatePeak (meterIn, inPeak);
+    accumulatePeak (meterOut, outPeak);
+    accumulatePeak (meterWet, wetPeak);
     visualPhase.store (engine.getPhase(), std::memory_order_relaxed);
     visualGate.store (engine.getGateValue(), std::memory_order_relaxed);
     visualBpm.store (transport.bpm, std::memory_order_relaxed);
@@ -272,16 +289,21 @@ void GateVerbAudioProcessor::markChanged()
     updateHostDisplay (ChangeDetails().withNonParameterStateChanged (true));
 }
 
+void GateVerbAudioProcessor::publishCurve (const Curve& curve)
+{
+    const juce::ScopedLock lock (stateLock);
+    curveRevision.fetch_add (1, std::memory_order_acq_rel);
+    // Paired with the reader's acquire fence, including on weakly ordered CPUs.
+    std::atomic_thread_fence (std::memory_order_release);
+    for (size_t i = 0; i < curveSize; ++i)
+        curveStorage[i].store (std::isfinite (curve[i]) ? juce::jlimit (0.0f, 1.0f, curve[i]) : 0.0f,
+                               std::memory_order_relaxed);
+    curveRevision.fetch_add (1, std::memory_order_release);
+}
+
 void GateVerbAudioProcessor::setCurve (const Curve& curve)
 {
-    {
-        const juce::ScopedLock lock (stateLock);
-        curveRevision.fetch_add (1, std::memory_order_acq_rel);
-        for (size_t i = 0; i < curveSize; ++i)
-            curveStorage[i].store (std::isfinite (curve[i]) ? juce::jlimit (0.0f, 1.0f, curve[i]) : 0.0f,
-                                   std::memory_order_relaxed);
-        curveRevision.fetch_add (1, std::memory_order_release);
-    }
+    publishCurve (curve);
     markChanged();
 }
 
@@ -292,10 +314,10 @@ GateVerbAudioProcessor::Curve GateVerbAudioProcessor::makeShape (int shape)
     constexpr std::array<float, 16> steps { 1, 1, 0, 0, 0.72f, 0, 0.35f, 0, 1, 0, 0.5f, 0.5f, 0, 0.8f, 0, 0 };
     for (size_t i = 0; i < curveSize; ++i)
     {
-        const auto t = static_cast<float> (i) / static_cast<float> (curveSize - 1);
+        const auto t = static_cast<float> (i) / static_cast<float> (curveSize);
         switch (shape)
         {
-            case 1: c[i] = t < 0.48f ? 1.0f : 0.0f; break;
+            case 1: c[i] = t < 0.5f ? 1.0f : 0.0f; break;
             case 2: c[i] = t < 0.06f ? 0.0f : std::pow (juce::jlimit (0.0f, 1.0f, (t - 0.06f) / 0.78f), 0.65f); break;
             case 3: c[i] = t * t; break;
             case 4: c[i] = (1.0f - t) * (1.0f - t); break;
@@ -311,15 +333,21 @@ void GateVerbAudioProcessor::applyShape (int index) { setCurve (makeShape (index
 
 void GateVerbAudioProcessor::setEditorMode (int mode)
 {
-    editorMode.store (juce::jlimit (0, 1, mode), std::memory_order_relaxed);
-    sendChangeMessage();
+    mode = juce::jlimit (0, 1, mode);
+    if (editorMode.exchange (mode, std::memory_order_relaxed) != mode)
+    {
+        sendChangeMessage();
+        updateHostDisplay (ChangeDetails().withNonParameterStateChanged (true));
+    }
 }
 
 void GateVerbAudioProcessor::setGridSize (int size)
 {
-    if (size == 4 || size == 8 || size == 16 || size == 32 || size == 64)
-        gridSize.store (size, std::memory_order_relaxed);
-    sendChangeMessage();
+    if (isValidGridSize (size) && gridSize.exchange (size, std::memory_order_relaxed) != size)
+    {
+        sendChangeMessage();
+        updateHostDisplay (ChangeDetails().withNonParameterStateChanged (true));
+    }
 }
 
 juce::StringArray GateVerbAudioProcessor::getFactoryPresetNames() const
@@ -410,11 +438,17 @@ juce::Result GateVerbAudioProcessor::restoreState (const juce::ValueTree& source
             return juce::Result::fail ("The preset contains an invalid gate value.");
         curve[i] = value;
     }
-    // Validate every parameter before changing any state. Reject corrupt partial files.
+    // Validate every parameter before changing any state. Only validated values
+    // enter the APVTS; duplicate IDs must not override a previously checked value.
+    juce::ValueTree cleanState (stateType);
     for (const auto* id : parameterIds)
     {
         const auto node = source.getChildWithProperty ("id", id);
-        if (! node.isValid() || ! node.hasProperty ("value"))
+        int occurrences = 0;
+        for (const auto child : source)
+            if (child.getProperty ("id").toString() == id)
+                ++occurrences;
+        if (occurrences != 1 || ! node.hasType ("PARAM") || ! node.hasProperty ("value"))
             return juce::Result::fail ("The preset is missing parameter: " + juce::String (id));
         const auto text = node.getProperty ("value").toString().toStdString();
         char* end = nullptr;
@@ -422,14 +456,19 @@ juce::Result GateVerbAudioProcessor::restoreState (const juce::ValueTree& source
         const auto& r = apvts.getParameter (id)->getNormalisableRange();
         if (end == text.c_str() || *end != '\0' || ! std::isfinite (value) || value < r.start || value > r.end)
             return juce::Result::fail ("The preset contains an invalid parameter: " + juce::String (id));
+        juce::ValueTree checked ("PARAM");
+        checked.setProperty ("id", id, nullptr);
+        checked.setProperty ("value", value, nullptr);
+        cleanState.appendChild (checked, nullptr);
     }
     {
         const juce::ScopedLock lock (stateLock);
-        apvts.replaceState (source.createCopy());
-        setCurve (curve);
+        apvts.replaceState (cleanState);
+        publishCurve (curve);
         presetName = source.getProperty ("presetName", "User Preset").toString().substring (0, 100);
         editorMode.store (juce::jlimit (0, 1, static_cast<int> (source.getProperty ("editorMode", 0))));
-        setGridSize (static_cast<int> (source.getProperty ("gridSize", 16)));
+        const auto restoredGrid = static_cast<int> (source.getProperty ("gridSize", 16));
+        gridSize.store (isValidGridSize (restoredGrid) ? restoredGrid : 16);
         presetDirty.store (static_cast<bool> (source.getProperty ("presetDirty", false)));
     }
     sendChangeMessage();
@@ -452,8 +491,11 @@ void GateVerbAudioProcessor::setStateInformation (const void* data, int bytes)
 
 juce::File GateVerbAudioProcessor::getUserPresetDirectory()
 {
-    return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-        .getChildFile ("studiobro").getChildFile ("GATE-VERB").getChildFile ("Presets");
+    auto base = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory);
+   #if JUCE_MAC
+    base = base.getChildFile ("Application Support");
+   #endif
+    return base.getChildFile ("studiobro").getChildFile ("GATE-VERB").getChildFile ("Presets");
 }
 
 juce::Result GateVerbAudioProcessor::saveUserPreset (const juce::File& file)
@@ -477,6 +519,7 @@ juce::Result GateVerbAudioProcessor::saveUserPreset (const juce::File& file)
     }
     presetDirty.store (false);
     sendChangeMessage();
+    updateHostDisplay (ChangeDetails().withNonParameterStateChanged (true));
     return juce::Result::ok();
 }
 
