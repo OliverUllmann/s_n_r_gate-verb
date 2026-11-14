@@ -48,5 +48,8 @@ if [[ -f test-output/GATE-VERB-UI.png ]]; then
 fi
 
 ditto -c -k --sequesterRsrc --keepParent "$package_root" "$package_root.zip"
-shasum -a 256 "$package_root.zip" > "$package_root.zip.sha256"
+(
+    cd "${package_root%/*}"
+    shasum -a 256 "${package_root##*/}.zip" > "${package_root##*/}.zip.sha256"
+)
 echo "Created $package_root.zip"

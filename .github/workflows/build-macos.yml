@@ -63,7 +63,7 @@ jobs:
           plugin="build/GateVerb_artefacts/Release/VST3/GATE-VERB.vst3"
           binary="$plugin/Contents/MacOS/GATE-VERB"
           lipo -info "$binary"
-          lipo -verify_arch x86_64 arm64 "$binary"
+          lipo "$binary" -verify_arch x86_64 arm64
           codesign --force --deep --sign - "$plugin"
           codesign --verify --deep --strict --verbose=2 "$plugin"
 
